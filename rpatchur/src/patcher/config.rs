@@ -11,6 +11,7 @@ pub struct PatcherConfiguration {
     pub window: WindowConfiguration,
     pub play: PlayConfiguration,
     pub setup: SetupConfiguration,
+    pub repair: Option<RepairConfiguration>,
     pub web: WebConfiguration,
     pub client: ClientConfiguration,
     pub patching: PatchingConfiguration,
@@ -33,6 +34,13 @@ pub struct PlayConfiguration {
 
 #[derive(Deserialize, Clone)]
 pub struct SetupConfiguration {
+    pub path: String,
+    pub arguments: Vec<String>,
+    pub exit_on_success: Option<bool>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct RepairConfiguration {
     pub path: String,
     pub arguments: Vec<String>,
     pub exit_on_success: Option<bool>,

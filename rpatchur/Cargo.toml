@@ -19,11 +19,12 @@ winres = "0.1"
 gruf = { version = "0.2", path = "../gruf" }
 
 open = "1.7.0"
-web-view = "0.7.3"
+wry = "0.24"
+tao = "0.16"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.8"
 futures = "0.3"
-tokio = { version = "1.8", features = ["macros", "fs", "sync", "io-util"] }
+tokio = { version = "1.40", features = ["macros", "fs", "sync", "io-util", "rt"] }
 reqwest = { version = "0.11", features = ["stream"] }
 url = "2.2"
 tempfile = "3.1"
@@ -36,6 +37,7 @@ tinyfiledialogs = "3.3"
 structopt = "0.3"
 scopeguard = "1.1"
 advisory-lock = "0.3"
+image = "0.24"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.6", features = ["shellapi"] }

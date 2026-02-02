@@ -6,18 +6,18 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use advisory_lock::{AdvisoryFileLock, FileLockMode};
 use anyhow::{anyhow, Context, Result};
 use futures::executor::block_on;
 use futures::stream::{StreamExt, TryStreamExt};
 use gruf::thor::{self, ThorArchive, ThorPatchInfo, ThorPatchList};
 use gruf::GrufError;
 use tokio::fs::File;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use super::cache::{read_cache_file, write_cache_file, PatcherCache};
 use super::cancellation::{
+
     process_incoming_commands, wait_for_cancellation, InterruptibleFnError, InterruptibleFnResult,
 };
 use super::config::PatchServerInfo;
@@ -167,12 +167,12 @@ fn apply_single_patch(
 fn take_update_lock() -> Result<std::fs::File> {
     let lock_file_name = get_update_lock_file_path()?;
     let lock_file = std::fs::File::create(lock_file_name)?;
-    lock_file.try_lock(FileLockMode::Exclusive)?;
+    lock_file.try_lock()?;
 
     Ok(lock_file)
 }
 
-/// Main routine of the patching task.
+
 ///
 /// This routine is written in a way that makes it interuptible (or cancellable)
 /// with a relatively low latency.

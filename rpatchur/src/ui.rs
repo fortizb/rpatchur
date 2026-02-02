@@ -1,80 +1,71 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::patcher::{get_patcher_name, PatcherCommand, PatcherConfiguration};
 use crate::process::start_executable;
 use serde::Deserialize;
 use serde_json::Value;
 use tinyfiledialogs as tfd;
-use web_view::{Content, Handle, WebView};
+use wry::application::event_loop::EventLoop;
+use wry::application::window::WindowBuilder;
+use wry::webview::WebViewBuilder;
+use wry::application::window::Icon;
+use image::io::Reader as ImageReader;
+use std::io::Cursor;
 
-/// 'Opaque" struct that can be used to update the UI.
+pub enum UiCommand {
+    EvaluateScript(String),
+}
+
 pub struct UiController {
-    web_view_handle: Handle<WebViewUserData>,
+    ui_tx: flume::Sender<UiCommand>,
 }
+
 impl UiController {
-    pub fn new(web_view: &WebView<'_, WebViewUserData>) -> UiController {
-        UiController {
-            web_view_handle: web_view.handle(),
-        }
+    pub fn new(ui_tx: flume::Sender<UiCommand>) -> UiController {
+        UiController { ui_tx }
     }
 
-    /// Allows another thread to indicate the current status of the patching process.
-    ///
-    /// This updates the UI with useful information.
     pub fn dispatch_patching_status(&self, status: PatchingStatus) {
-        if let Err(e) = self.web_view_handle.dispatch(move |webview| {
-            let result = match status {
-                PatchingStatus::Ready => webview.eval("patchingStatusReady()"),
-                PatchingStatus::Error(msg) => {
-                    webview.eval(&format!("patchingStatusError(\"{}\")", msg))
-                }
-                PatchingStatus::DownloadInProgress(nb_downloaded, nb_total, bytes_per_sec) => {
-                    webview.eval(&format!(
-                        "patchingStatusDownloading({}, {}, {})",
-                        nb_downloaded, nb_total, bytes_per_sec
-                    ))
-                }
-                PatchingStatus::InstallationInProgress(nb_installed, nb_total) => webview.eval(
-                    &format!("patchingStatusInstalling({}, {})", nb_installed, nb_total),
-                ),
-                PatchingStatus::ManualPatchApplied(name) => {
-                    webview.eval(&format!("patchingStatusPatchApplied(\"{}\")", name))
-                }
-            };
-            if let Err(e) = result {
-                log::warn!("Failed to dispatch patching status: {}.", e);
+        let script = match status {
+            PatchingStatus::Ready => "patchingStatusReady()".to_string(),
+            PatchingStatus::Error(msg) => format!("patchingStatusError(\"{}\")", msg),
+            PatchingStatus::DownloadInProgress(nb_downloaded, nb_total, bytes_per_sec) => {
+                format!(
+                    "patchingStatusDownloading({}, {}, {})",
+                    nb_downloaded, nb_total, bytes_per_sec
+                )
             }
-            Ok(())
-        }) {
-            log::warn!("Failed to dispatch patching status: {}.", e);
-        }
+            PatchingStatus::InstallationInProgress(nb_installed, nb_total) => {
+                format!("patchingStatusInstalling({}, {})", nb_installed, nb_total)
+            }
+            PatchingStatus::ManualPatchApplied(name) => {
+                format!("patchingStatusPatchApplied(\"{}\")", name)
+            }
+        };
+
+        let _ = self.ui_tx.send(UiCommand::EvaluateScript(script));
     }
 
-    pub fn set_patch_in_progress(&self, value: bool) {
-        if let Err(e) = self.web_view_handle.dispatch(move |webview| {
-            webview.user_data_mut().patching_in_progress = value;
-            Ok(())
-        }) {
-            log::warn!("Failed to dispatch patching status: {}.", e);
-        }
+    pub fn set_patch_in_progress(&self, _value: bool) {
     }
 }
 
-/// Used to indicate the current status of the patching process.
 pub enum PatchingStatus {
     Ready,
-    Error(String),                         // Error message
-    DownloadInProgress(usize, usize, u64), // Downloaded files, Total number, Bytes per second
-    InstallationInProgress(usize, usize),  // Installed patches, Total number
-    ManualPatchApplied(String),            // Patch file name
+    Error(String),
+    DownloadInProgress(usize, usize, u64),
+    InstallationInProgress(usize, usize),
+    ManualPatchApplied(String),
 }
 
 pub struct WebViewUserData {
-    patcher_config: PatcherConfiguration,
-    patching_thread_tx: flume::Sender<PatcherCommand>,
-    patching_in_progress: bool,
+    pub patcher_config: PatcherConfiguration,
+    pub patching_thread_tx: flume::Sender<PatcherCommand>,
+    pub patching_in_progress: bool,
 }
+
 impl WebViewUserData {
     pub fn new(
         patcher_config: PatcherConfiguration,
@@ -87,69 +78,121 @@ impl WebViewUserData {
         }
     }
 }
+
 impl Drop for WebViewUserData {
     fn drop(&mut self) {
-        // Ask the patching thread to stop whenever WebViewUserData is dropped
         let _res = self.patching_thread_tx.try_send(PatcherCommand::Quit);
     }
 }
 
-/// Creates a `WebView` object with the appropriate settings for our needs.
-pub fn build_webview<'a>(
-    title: &'a str,
+pub fn build_webview(
+    title: &str,
     user_data: WebViewUserData,
-) -> web_view::WVResult<WebView<'a, WebViewUserData>> {
-    web_view::builder()
-        .title(title)
-        .content(Content::Url(user_data.patcher_config.web.index_url.clone()))
-        .size(
-            user_data.patcher_config.window.width,
-            user_data.patcher_config.window.height,
-        )
-        .resizable(user_data.patcher_config.window.resizable)
-        .user_data(user_data)
-        .invoke_handler(|webview, arg| {
-            match arg {
-                "play" => handle_play(webview),
-                "setup" => handle_setup(webview),
-                "exit" => handle_exit(webview),
-                "start_update" => handle_start_update(webview),
-                "cancel_update" => handle_cancel_update(webview),
-                "reset_cache" => handle_reset_cache(webview),
-                "manual_patch" => handle_manual_patch(webview),
-                request => handle_json_request(webview, request),
-            }
-            Ok(())
+) -> anyhow::Result<(EventLoop<()>, Arc<wry::webview::WebView>, Arc<Mutex<WebViewUserData>>, flume::Sender<UiCommand>, flume::Receiver<UiCommand>)> {
+    let event_loop = EventLoop::new();
+    
+    let mut window_builder = WindowBuilder::new()
+        .with_title(title)
+        .with_inner_size(wry::application::dpi::LogicalSize::new(
+            user_data.patcher_config.window.width as f64,
+            user_data.patcher_config.window.height as f64,
+        ))
+        .with_resizable(user_data.patcher_config.window.resizable);
+    
+    if let Some(icon) = load_window_icon() {
+        window_builder = window_builder.with_window_icon(Some(icon));
+    }
+    
+    let window = window_builder.build(&event_loop)?;
+
+    let url = user_data.patcher_config.web.index_url.clone();
+    let user_data = Arc::new(Mutex::new(user_data));
+    let user_data_clone = Arc::clone(&user_data);
+
+    let (ui_tx, ui_rx) = flume::unbounded();
+
+    let webview = WebViewBuilder::new(window)?
+        .with_url(&url)?
+        .with_ipc_handler(move |_window, message| {
+            handle_message(&message, &user_data_clone);
         })
-        .build()
+        .build()?;
+
+    Ok((event_loop, Arc::new(webview), user_data, ui_tx, ui_rx))
 }
 
-/// Opens the configured game client with the configured arguments.
-///
-/// This function can create elevated processes on Windows with UAC activated.
-fn handle_play(webview: &mut WebView<WebViewUserData>) {
-    let client_arguments = webview.user_data().patcher_config.play.arguments.clone();
-    start_game_client(webview, &client_arguments);
+fn handle_message(message: &str, user_data: &Arc<Mutex<WebViewUserData>>) {
+    println!("========================================");
+    println!("IPC MESSAGE RECEIVED: '{}'", message);
+    println!("========================================");
+    
+    match message {
+        "play" => {
+            println!("Handling: play");
+            handle_play(user_data)
+        },
+        "setup" => {
+            println!("Handling: setup");
+            handle_setup(user_data)
+        },
+        "repair" => {
+            println!("Handling: repair");
+            handle_repair(user_data)
+        },
+        "exit" => {
+            println!("Handling: exit");
+            std::process::exit(0)
+        },
+        "start_update" => {
+            println!("Handling: start_update");
+            handle_start_update(user_data)
+        },
+        "cancel_update" => {
+            println!("Handling: cancel_update");
+            handle_cancel_update(user_data)
+        },
+        "reset_cache" => {
+            println!("Handling: reset_cache");
+            handle_reset_cache()
+        },
+        "manual_patch" => {
+            println!("Handling: manual_patch");
+            handle_manual_patch(user_data)
+        },
+        request => {
+            println!("Handling: JSON request");
+            handle_json_request(user_data, request)
+        },
+    }
 }
 
-/// Opens the configured 'Setup' software with the configured arguments.
-///
-/// This function can create elevated processes on Windows with UAC activated.
-fn handle_setup(webview: &mut WebView<WebViewUserData>) {
-    let setup_exe: &String = &webview.user_data().patcher_config.setup.path;
-    let setup_arguments = &webview.user_data().patcher_config.setup.arguments;
-    let exit_on_success = webview
-        .user_data()
+fn handle_play(user_data: &Arc<Mutex<WebViewUserData>>) {
+    let client_arguments = user_data
+        .lock()
+        .unwrap()
         .patcher_config
-        .setup
-        .exit_on_success
-        .unwrap_or(false);
-    match start_executable(setup_exe, setup_arguments) {
+        .play
+        .arguments
+        .clone();
+    start_game_client(user_data, &client_arguments);
+}
+
+fn handle_setup(user_data: &Arc<Mutex<WebViewUserData>>) {
+    let (setup_exe, setup_arguments, exit_on_success) = {
+        let data = user_data.lock().unwrap();
+        (
+            data.patcher_config.setup.path.clone(),
+            data.patcher_config.setup.arguments.clone(),
+            data.patcher_config.setup.exit_on_success.unwrap_or(false),
+        )
+    };
+
+    match start_executable(&setup_exe, &setup_arguments) {
         Ok(success) => {
             if success {
                 log::trace!("Setup software started");
                 if exit_on_success {
-                    webview.exit();
+                    std::process::exit(0);
                 }
             }
         }
@@ -159,35 +202,92 @@ fn handle_setup(webview: &mut WebView<WebViewUserData>) {
     }
 }
 
-/// Exits the patcher cleanly.
-fn handle_exit(webview: &mut WebView<WebViewUserData>) {
-    webview.exit();
+
+fn handle_repair(user_data: &Arc<Mutex<WebViewUserData>>) {
+    println!("========================================");
+    println!("=== REPAIR BUTTON CLICKED ===");
+    println!("========================================");
+    log::info!("=== REPAIR BUTTON CLICKED ===");
+
+    let repair_config = {
+        let data = user_data.lock().unwrap();
+        println!("Locked user_data successfully");
+        log::info!("Locked user_data successfully");
+        data.patcher_config.repair.clone()
+    };
+
+    if let Some(repair) = repair_config {
+        let repair_exe = repair.path.clone();
+        let repair_arguments = repair.arguments.clone();
+        let exit_on_success = repair.exit_on_success.unwrap_or(false);
+
+        println!("Repair configuration found:");
+        println!("  - Path: {}", repair_exe);
+        println!("  - Arguments: {:?}", repair_arguments);
+        println!("  - Exit on success: {}", exit_on_success);
+        
+        log::info!("Repair configuration found:");
+        log::info!("  - Path: {}", repair_exe);
+        log::info!("  - Arguments: {:?}", repair_arguments);
+        log::info!("  - Exit on success: {}", exit_on_success);
+
+        let current_dir = std::env::current_dir().unwrap_or_default();
+        println!("  - Current directory: {:?}", current_dir);
+        log::info!("  - Current directory: {:?}", current_dir);
+
+        println!("Attempting to start repair tool...");
+        log::info!("Attempting to start repair tool...");
+        match start_executable(&repair_exe, &repair_arguments) {
+            Ok(success) => {
+                println!("start_executable returned: {}", success);
+                log::info!("start_executable returned: {}", success);
+                if success {
+                    println!("Repair tool started successfully");
+                    log::info!("Repair tool started successfully");
+                    if exit_on_success {
+                        println!("Exiting application as configured");
+                        log::info!("Exiting application as configured");
+                        std::process::exit(0);
+                    }
+                } else {
+                    println!("WARNING: start_executable returned false");
+                    log::warn!("start_executable returned false - repair tool may not have started");
+                }
+            }
+            Err(e) => {
+                println!("ERROR: Failed to start repair tool: {}", e);
+                println!("Error details: {:?}", e);
+                log::error!("Failed to start repair tool: {}", e);
+                log::error!("Error details: {:?}", e);
+            }
+        }
+    } else {
+        println!("ERROR: Repair configuration not found in rpatchur.yml");
+        log::error!("Repair configuration not found in rpatchur.yml");
+        log::error!("Please add a 'repair:' section to your configuration file");
+    }
+
+    println!("=== REPAIR HANDLER FINISHED ===");
+    println!("========================================");
+    log::info!("=== REPAIR HANDLER FINISHED ===");
 }
 
-/// Starts the patching task/thread.
-fn handle_start_update(webview: &mut WebView<WebViewUserData>) {
-    // Patching is already in progress, abort.
-    if webview.user_data().patching_in_progress {
-        let res = webview.eval("notificationInProgress()");
-        if let Err(e) = res {
-            log::warn!("Failed to dispatch notification: {}.", e);
-        }
+fn handle_start_update(user_data: &Arc<Mutex<WebViewUserData>>) {
+    let data = user_data.lock().unwrap();
+    if data.patching_in_progress {
+        log::warn!("Patching already in progress");
         return;
     }
 
-    let send_res = webview
-        .user_data_mut()
-        .patching_thread_tx
-        .send(PatcherCommand::StartUpdate);
+    let send_res = data.patching_thread_tx.send(PatcherCommand::StartUpdate);
     if send_res.is_ok() {
         log::trace!("Sent StartUpdate command to patching thread");
     }
 }
 
-/// Cancels the patching task/thread.
-fn handle_cancel_update(webview: &mut WebView<WebViewUserData>) {
-    if webview
-        .user_data_mut()
+fn handle_cancel_update(user_data: &Arc<Mutex<WebViewUserData>>) {
+    let data = user_data.lock().unwrap();
+    if data
         .patching_thread_tx
         .send(PatcherCommand::CancelUpdate)
         .is_ok()
@@ -196,9 +296,7 @@ fn handle_cancel_update(webview: &mut WebView<WebViewUserData>) {
     }
 }
 
-/// Resets the patcher cache (which is used to keep track of already applied
-/// patches).
-fn handle_reset_cache(_webview: &mut WebView<WebViewUserData>) {
+fn handle_reset_cache() {
     if let Ok(patcher_name) = get_patcher_name() {
         let cache_file_path = PathBuf::from(patcher_name).with_extension("dat");
         if let Err(e) = fs::remove_file(cache_file_path) {
@@ -207,14 +305,10 @@ fn handle_reset_cache(_webview: &mut WebView<WebViewUserData>) {
     }
 }
 
-/// Asks the user to provide a patch file to apply
-fn handle_manual_patch(webview: &mut WebView<WebViewUserData>) {
-    // Patching is already in progress, abort.
-    if webview.user_data().patching_in_progress {
-        let res = webview.eval("notificationInProgress()");
-        if let Err(e) = res {
-            log::warn!("Failed to dispatch notification: {}.", e);
-        }
+fn handle_manual_patch(user_data: &Arc<Mutex<WebViewUserData>>) {
+    let data = user_data.lock().unwrap();
+    if data.patching_in_progress {
+        log::warn!("Patching already in progress");
         return;
     }
 
@@ -225,8 +319,7 @@ fn handle_manual_patch(webview: &mut WebView<WebViewUserData>) {
     );
     if let Some(path) = opt_path {
         log::info!("Requesting manual patch '{}'", path);
-        if webview
-            .user_data_mut()
+        if data
             .patching_thread_tx
             .send(PatcherCommand::ApplyPatch(PathBuf::from(path)))
             .is_ok()
@@ -236,9 +329,7 @@ fn handle_manual_patch(webview: &mut WebView<WebViewUserData>) {
     }
 }
 
-/// Parses JSON requests (for invoking functions with parameters) and dispatches
-/// them to the invoked function.
-fn handle_json_request(webview: &mut WebView<WebViewUserData>, request: &str) {
+fn handle_json_request(user_data: &Arc<Mutex<WebViewUserData>>, request: &str) {
     let result: serde_json::Result<Value> = serde_json::from_str(request);
     match result {
         Err(e) => {
@@ -249,7 +340,7 @@ fn handle_json_request(webview: &mut WebView<WebViewUserData>, request: &str) {
             if let Some(function_name) = function_name {
                 let function_params = json_req["parameters"].clone();
                 match function_name {
-                    "login" => handle_login(webview, function_params),
+                    "login" => handle_login(user_data, function_params),
                     "open_url" => handle_open_url(function_params),
                     _ => {
                         log::error!("Unknown function '{}'", function_name);
@@ -260,46 +351,35 @@ fn handle_json_request(webview: &mut WebView<WebViewUserData>, request: &str) {
     }
 }
 
-/// Parameters expected for the login function
 #[derive(Deserialize)]
 struct LoginParameters {
     login: String,
     password: String,
 }
 
-/// Launches the game client with the given credentials
-fn handle_login(webview: &mut WebView<WebViewUserData>, parameters: Value) {
+fn handle_login(user_data: &Arc<Mutex<WebViewUserData>>, parameters: Value) {
     let result: serde_json::Result<LoginParameters> = serde_json::from_value(parameters);
     match result {
         Err(e) => log::error!("Invalid arguments given for 'login': {}", e),
         Ok(login_params) => {
-            // Push credentials to the list of arguments first
             let mut play_arguments: Vec<String> = vec![
                 format!("-t:{}", login_params.password),
                 login_params.login,
                 "server".to_string(),
             ];
-            play_arguments.extend(
-                webview
-                    .user_data()
-                    .patcher_config
-                    .play
-                    .arguments
-                    .iter()
-                    .cloned(),
-            );
-            start_game_client(webview, &play_arguments);
+            let data = user_data.lock().unwrap();
+            play_arguments.extend(data.patcher_config.play.arguments.iter().cloned());
+            drop(data);
+            start_game_client(user_data, &play_arguments);
         }
     }
 }
 
-/// Parameters expected for the open_url function
 #[derive(Deserialize)]
 struct OpenUrlParameters {
     url: String,
 }
 
-/// Opens an URL with the native URL Handler
 fn handle_open_url(parameters: Value) {
     let result: serde_json::Result<OpenUrlParameters> = serde_json::from_value(parameters);
     match result {
@@ -319,20 +399,21 @@ fn handle_open_url(parameters: Value) {
     }
 }
 
-fn start_game_client(webview: &mut WebView<WebViewUserData>, client_arguments: &[String]) {
-    let client_exe: &String = &webview.user_data().patcher_config.play.path;
-    let exit_on_success = webview
-        .user_data()
-        .patcher_config
-        .play
-        .exit_on_success
-        .unwrap_or(true);
-    match start_executable(client_exe, client_arguments) {
+fn start_game_client(user_data: &Arc<Mutex<WebViewUserData>>, client_arguments: &[String]) {
+    let (client_exe, exit_on_success) = {
+        let data = user_data.lock().unwrap();
+        (
+            data.patcher_config.play.path.clone(),
+            data.patcher_config.play.exit_on_success.unwrap_or(true),
+        )
+    };
+
+    match start_executable(&client_exe, client_arguments) {
         Ok(success) => {
             if success {
                 log::trace!("Client started");
                 if exit_on_success {
-                    webview.exit();
+                    std::process::exit(0);
                 }
             }
         }
@@ -340,4 +421,21 @@ fn start_game_client(webview: &mut WebView<WebViewUserData>, client_arguments: &
             log::warn!("Failed to start client: {}", e);
         }
     }
+}
+
+
+fn load_window_icon() -> Option<Icon> {
+    const ICON_BYTES: &[u8] = include_bytes!("../resources/rpatchur.ico");
+    
+    let img = ImageReader::new(Cursor::new(ICON_BYTES))
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let rgba_data = rgba.into_raw();
+    
+    Icon::from_rgba(rgba_data, width, height).ok()
 }
